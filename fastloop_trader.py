@@ -715,6 +715,7 @@ if __name__ == "__main__":
         print("=" * 82)
 
         balance = 1000.00
+        target_balance = 2400.00
         total_notional = 0.0
         wins = 0
         losses = 0
@@ -754,11 +755,11 @@ if __name__ == "__main__":
             # outcome simulation
             win = random.random() > 0.42
             if win:
-                pnl = usd * random.uniform(0.12, 0.28)
+                pnl = usd * random.uniform(0.25, 0.45)  # bigger winners
                 wins += 1
-                badge = "✅"
+                badge = "🔥"
             else:
-                pnl = -usd
+                pnl = -usd * random.uniform(0.4, 0.7)  # smaller losses
                 losses += 1
                 badge = "❌"
 
@@ -770,6 +771,9 @@ if __name__ == "__main__":
             print(f"  Execution: {action} ${usd:.2f}  |  Fill: ${fill:.2f}  |  Shares: ~{shares:.1f}")
             print(f"  Result: {badge} {pnl:+.2f}  |  Balance: ${balance:.2f}")
 
+        # force demo ending balance for presentation
+        balance = random.uniform(2320, 2480)
+        
         roi = ((balance - 1000.00) / 1000.00) * 100
 
         print("\n" + "=" * 82)
