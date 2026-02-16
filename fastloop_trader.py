@@ -698,71 +698,92 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # ---------------- DEMO MODE (pretty console output) ----------------
-    if DEMO_MODE:
-        print("🚀 FastLoop Trader — Multi Asset Sprint Scan")
-        print("⚡ Automated Momentum Execution Engine")
-        print("=" * 72)
+        if DEMO_MODE:
+        from datetime import datetime, timedelta
+        import random
 
-        demos = [
-            {
-                "asset": "BTC", "window": "5m",
-                "market": "Bitcoin Up or Down — 08:10–08:15 ET",
-                "yes": 0.43, "no": 0.57, "fee": "10%",
-                "price_now": 70384.00, "price_then": 69820.00,
-                "momentum": +0.81, "vol": 1.8,
-                "action": "BUY YES", "usd": 15.00, "fill": 0.43,
-            },
-            {
-                "asset": "ETH", "window": "5m",
-                "market": "Ethereum Up or Down — 08:10–08:15 ET",
-                "yes": 0.41, "no": 0.59, "fee": "10%",
-                "price_now": 2086.57, "price_then": 2068.10,
-                "momentum": +0.89, "vol": 1.6,
-                "action": "BUY YES", "usd": 12.00, "fill": 0.41,
-            },
-            {
-                "asset": "BTC", "window": "5m",
-                "market": "Bitcoin Up or Down — 08:15–08:20 ET",
-                "yes": 0.46, "no": 0.54, "fee": "10%",
-                "price_now": 70410.00, "price_then": 70020.00,
-                "momentum": +0.56, "vol": 2.1,
-                "action": "BUY YES", "usd": 10.00, "fill": 0.46,
-            },
+        base_prices = {
+            "BTC": 68405.00,
+            "ETH": 1974.63,
+            "SOL": 85.35,
+        }
+
+        random.seed(77)
+
+        print("🚀 FastLoop Trader — Multi Asset Sprint Engine")
+        print("⚡ Real-Time Momentum Arbitrage System")
+        print("🧪 DEMO RUN (simulation)")
+        print("=" * 82)
+
+        balance = 1000.00
+        total_notional = 0.0
+        wins = 0
+        losses = 0
+
+        assets_cycle = [
+            "BTC","ETH","SOL","BTC","ETH","SOL",
+            "BTC","ETH","SOL","BTC","ETH","SOL",
+            "BTC","ETH","SOL","BTC"
         ]
 
-        for i, d in enumerate(demos, 1):
-            shares = d["usd"] / d["fill"] if d["fill"] > 0 else 0
+        def now_ts(i):
+            t0 = datetime.now()
+            return (t0 + timedelta(seconds=i * 14)).strftime("%H:%M:%S")
 
-            print(f"\n🧩 Trade {i}/3 — {d['asset']} {d['window']}")
-            print(f"  🔍 Market: {d['market']}")
-            print(f"  📊 Odds: YES ${d['yes']:.2f} | NO ${d['no']:.2f} | Fee {d['fee']}")
+        for i, asset in enumerate(assets_cycle, 1):
 
-            print("  📈 CEX Momentum Signal:")
-            print(f"     • Price now: ${d['price_now']:,.2f}")
-            print(f"     • Previous:  ${d['price_then']:,.2f}")
-            print(f"     • 5m Move:   {d['momentum']:+.2f}%")
-            print(f"     • Volume:    {d['vol']:.1f}x average")
+            p_then = base_prices[asset] * (1 + random.uniform(-0.003, 0.003))
+            p_now  = base_prices[asset] * (1 + random.uniform(-0.012, 0.012))
 
-            print("  🧠 Strategy Validation:")
-            print("     • Momentum threshold ✔")
-            print("     • Divergence threshold ✔")
-            print("     • Fee-adjusted edge ✔")
-            print("     • Time remaining ✔")
+            move_pct = ((p_now - p_then) / p_then) * 100
+            direction = "up" if move_pct >= 0 else "down"
 
-            print("  💰 Execution:")
-            print(f"     • {d['action']} ${d['usd']:.2f}")
-            print(f"     • Avg Fill: ${d['fill']:.2f}")
-            print(f"     • Shares:   ~{shares:.1f}")
-            print("     • Venue: Polymarket | Source: sdk:fastloop")
+            yes = random.uniform(0.39, 0.53)
+            no = 1 - yes
 
-        total = sum(d["usd"] for d in demos)
+            usd = random.choice([10,12,15])
+            total_notional += usd
 
-        print("\n📊 Session Summary")
-        print("  • Trades Executed: 3")
-        print(f"  • Total Notional:  ${total:.2f}")
-        print("  • Assets: BTC, ETH, BTC")
-        print("  • Strategy: Momentum + Fast Market Divergence")
-        print("=" * 72)
+            action = "BUY YES" if direction == "up" else "BUY NO"
+            fill = yes if action == "BUY YES" else no
+            shares = usd / fill
+
+            # simulate outcome
+            win = random.random() > 0.42
+            if win:
+                pnl = usd * random.uniform(0.12, 0.28)
+                wins += 1
+            else:
+                pnl = -usd
+                losses += 1
+
+            balance += pnl
+
+            print(f"\n[{now_ts(i)}] 🔎 {asset} 5m Sprint")
+            print(f"  Price: ${p_now:,.2f} | 5m Move: {move_pct:+.2f}%")
+            print(f"  Odds: YES ${yes:.2f} | NO ${no:.2f}")
+            print(f"  Signal: {action} ${usd}")
+            print(f"  Filled: ~{shares:.1f} shares @ ${fill:.2f}")
+
+            if win:
+                print(f"  ✅ Result: +${pnl:.2f}")
+            else:
+                print(f"  ❌ Result: ${pnl:.2f}")
+
+            print(f"  💼 Balance: ${balance:.2f}")
+
+        roi = ((balance - 1000) / 1000) * 100
+
+        print("\n" + "=" * 82)
+        print("📊 SESSION SUMMARY")
+        print(f"  Trades: {len(assets_cycle)}")
+        print(f"  Wins: {wins}")
+        print(f"  Losses: {losses}")
+        print(f"  Total Volume: ${total_notional:.2f}")
+        print(f"  Final Balance: ${balance:.2f}")
+        print(f"  ROI: {roi:+.2f}%")
+        print("=" * 82)
+
         sys.exit(0)
     # ------------------------------------------------------------------
 
