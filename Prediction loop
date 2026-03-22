@@ -1,0 +1,440 @@
+"""
+prediction_loop.py
+──────────────────────────────────────────────────────────────────
+Autonomous prediction-market signal loop.
+
+Stack:
+  • Polymarket CLOB API  — real-time order books & probabilities
+  • Claude API (Sonnet)  — sentiment gap analysis vs crowd belief
+  • Execution engine     — position sizing, entry, logging
+
+All three components run inside a single async event loop.
+The system never trades on opinion — only on measured divergence
+between AI-estimated true probability and current market price.
+──────────────────────────────────────────────────────────────────
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+import aiohttp
+
+# ─── CONFIG ──────────────────────────────────────────────────────
+
+POLYMARKET_HOST   = "https://clob.polymarket.com"
+ANTHROPIC_HOST    = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+
+MIN_EDGE_THRESHOLD = 0.04   # minimum probability gap to act on (4 pp)
+MAX_POSITION_USDC  = 50.0   # max single-trade exposure in USDC
+SIGNAL_WINDOW_SEC  = 300    # look-back window for sentiment analysis (5 min)
+LOOP_INTERVAL_SEC  = 30     # seconds between market scans
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("prediction_loop")
+
+
+# ─── DATA MODELS ─────────────────────────────────────────────────
+
+@dataclass
+class OrderBook:
+    """Snapshot of a single Polymarket CLOB market."""
+    market_id:   str
+    question:    str
+    yes_price:   float          # best ask for YES token (≈ implied probability)
+    no_price:    float
+    yes_size:    float          # available liquidity at best ask
+    no_size:     float
+    timestamp:   float = field(default_factory=time.time)
+
+    @property
+    def spread(self) -> float:
+        return abs((self.yes_price + self.no_price) - 1.0)
+
+    @property
+    def implied_yes_prob(self) -> float:
+        """Mid-price as naive probability estimate."""
+        return self.yes_price / (self.yes_price + self.no_price)
+
+
+@dataclass
+class AISignal:
+    """Output from the Claude analysis layer."""
+    market_id:          str
+    true_prob_estimate: float   # AI's probability estimate for YES outcome
+    confidence:         float   # 0–1; how certain the model is
+    reasoning:          str
+    sources_checked:    int
+    latency_ms:         float
+
+
+@dataclass
+class TradeDecision:
+    """Result of merging order-book data with AI signal."""
+    market_id:   str
+    question:    str
+    direction:   str            # "YES" | "NO" | "PASS"
+    edge:        float          # AI prob − market prob (signed)
+    size_usdc:   float
+    entry_price: float
+    reason:      str
+
+
+@dataclass
+class TradeRecord:
+    """Immutable log entry written after every decision."""
+    ts:          str
+    market_id:   str
+    question:    str
+    direction:   str
+    entry_price: float
+    size_usdc:   float
+    edge:        float
+    ai_prob:     float
+    market_prob: float
+    outcome:     Optional[str]  = None   # filled at resolution
+    pnl_usdc:    Optional[float] = None
+
+
+# ─── LAYER 1 — POLYMARKET ────────────────────────────────────────
+
+class PolymarketClient:
+    """
+    Thin async wrapper around the Polymarket CLOB REST API.
+
+    Endpoints used:
+      GET /markets           — paginated list of active markets
+      GET /book?token_id=… — full order book for a specific token pair
+    """
+
+    def __init__(self, session: aiohttp.ClientSession):
+        self._s = session
+
+    async def active_markets(self, limit: int = 20) -> list[dict]:
+        """Return the top *limit* markets sorted by 24h volume."""
+        url = f"{POLYMARKET_HOST}/markets"
+        params = {"active": "true", "closed": "false", "limit": limit}
+        async with self._s.get(url, params=params) as r:
+            r.raise_for_status()
+            data = await r.json()
+        return data.get("data", [])
+
+    async def order_book(self, token_id: str) -> dict:
+        """Fetch full CLOB order book for one token."""
+        url = f"{POLYMARKET_HOST}/book"
+        async with self._s.get(url, params={"token_id": token_id}) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def snapshot(self, market: dict) -> Optional[OrderBook]:
+        """Parse a raw market dict into a typed OrderBook snapshot."""
+        try:
+            tokens = market.get("tokens", [])
+            yes_tok = next(t for t in tokens if t["outcome"] == "Yes")
+            no_tok  = next(t for t in tokens if t["outcome"] == "No")
+
+            book_yes = await self.order_book(yes_tok["token_id"])
+            book_no  = await self.order_book(no_tok["token_id"])
+
+            def best_ask(book: dict) -> tuple[float, float]:
+                asks = sorted(book.get("asks", []), key=lambda o: float(o["price"]))
+                if not asks:
+                    return 0.5, 0.0
+                return float(asks[0]["price"]), float(asks[0]["size"])
+
+            yp, ys = best_ask(book_yes)
+            np_, ns = best_ask(book_no)
+
+            return OrderBook(
+                market_id = market["condition_id"],
+                question  = market.get("question", ""),
+                yes_price = yp,
+                no_price  = np_,
+                yes_size  = ys,
+                no_size   = ns,
+            )
+        except (KeyError, StopIteration, aiohttp.ClientError) as exc:
+            log.warning("snapshot failed for %s: %s", market.get("condition_id"), exc)
+            return None
+
+
+# ─── LAYER 2 — AI SIGNAL (CLAUDE) ────────────────────────────────
+
+ANALYSIS_SYSTEM_PROMPT = """
+You are a prediction-market signal engine.
+
+Given a binary market question and recent real-world context, estimate the
+true probability that the YES outcome resolves correctly.
+
+Return ONLY valid JSON matching this schema:
+{
+  "true_prob": <float 0–1>,
+  "confidence": <float 0–1>,
+  "reasoning": "<one sentence>",
+  "sources_checked": <int>
+}
+
+Rules:
+- Anchor to verifiable facts, not narrative.
+- If evidence is thin, compress confidence toward 0.5.
+- Never fabricate sources.
+- Output only the JSON object, no prose, no markdown.
+"""
+
+class AIAnalyst:
+    """
+    Calls Claude to estimate the true probability for a market question.
+
+    The prompt includes:
+      • The market question
+      • Current market-implied probability (for calibration reference)
+      • A short context snippet (in production: pulled from live X/news data)
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, api_key: str):
+        self._s   = session
+        self._key = api_key
+
+    async def analyse(self, ob: OrderBook) -> AISignal:
+        t0 = time.perf_counter()
+
+        user_msg = (
+            f"Market question: {ob.question}\n"
+            f"Current market implied probability (YES): {ob.implied_yes_prob:.3f}\n"
+            f"Order-book spread: {ob.spread:.4f}\n\n"
+            "Based on available evidence, estimate the true probability of YES."
+        )
+
+        payload = {
+            "model":      ANTHROPIC_MODEL,
+            "max_tokens": 256,
+            "system":     ANALYSIS_SYSTEM_PROMPT,
+            "messages":   [{"role": "user", "content": user_msg}],
+        }
+
+        headers = {
+            "x-api-key":         self._key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        }
+
+        async with self._s.post(ANTHROPIC_HOST, json=payload, headers=headers) as r:
+            r.raise_for_status()
+            raw = await r.json()
+
+        latency = (time.perf_counter() - t0) * 1000
+        text    = raw["content"][0]["text"].strip()
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # fallback: neutral signal on parse error
+            parsed = {"true_prob": 0.5, "confidence": 0.0,
+                      "reasoning": "parse error", "sources_checked": 0}
+
+        return AISignal(
+            market_id          = ob.market_id,
+            true_prob_estimate = float(parsed.get("true_prob", 0.5)),
+            confidence         = float(parsed.get("confidence", 0.0)),
+            reasoning          = parsed.get("reasoning", ""),
+            sources_checked    = int(parsed.get("sources_checked", 0)),
+            latency_ms         = latency,
+        )
+
+
+# ─── LAYER 3 — EXECUTION ENGINE ──────────────────────────────────
+
+class ExecutionEngine:
+    """
+    Merges order-book data + AI signal → position decision → log.
+
+    Sizing model (linear Kelly approximation):
+      f = edge / (1 − best_price)   clipped to [0, MAX_POSITION_USDC]
+
+    In a live deployment this layer submits limit orders via the
+    Polymarket CLOB /order endpoint and tracks open positions.
+    Here it simulates fills and writes to a JSON log.
+    """
+
+    def __init__(self, log_path: str = "trade_log.jsonl"):
+        self._log_path = log_path
+        self._records:  list[TradeRecord] = []
+
+    # ── decision ────────────────────────────────────────────────
+
+    def decide(self, ob: OrderBook, sig: AISignal) -> TradeDecision:
+        market_prob = ob.implied_yes_prob
+        ai_prob     = sig.true_prob_estimate
+        edge        = ai_prob - market_prob           # positive → market underpricing YES
+
+        # filter: skip thin confidence or negligible edge
+        if sig.confidence < 0.5 or abs(edge) < MIN_EDGE_THRESHOLD:
+            return TradeDecision(
+                market_id   = ob.market_id,
+                question    = ob.question,
+                direction   = "PASS",
+                edge        = edge,
+                size_usdc   = 0.0,
+                entry_price = 0.0,
+                reason      = f"edge={edge:+.3f}, confidence={sig.confidence:.2f} — below threshold",
+            )
+
+        if edge > 0:
+            direction   = "YES"
+            entry_price = ob.yes_price
+            liquidity   = ob.yes_size
+        else:
+            direction   = "NO"
+            entry_price = ob.no_price
+            liquidity   = ob.no_size
+
+        # Kelly fraction (simplified, no fractional Kelly dampening)
+        kelly_f   = abs(edge) / (1.0 - entry_price + 1e-9)
+        raw_size  = kelly_f * MAX_POSITION_USDC
+        size_usdc = min(raw_size, MAX_POSITION_USDC, liquidity * entry_price)
+
+        return TradeDecision(
+            market_id   = ob.market_id,
+            question    = ob.question,
+            direction   = direction,
+            edge        = edge,
+            size_usdc   = round(size_usdc, 2),
+            entry_price = entry_price,
+            reason      = sig.reasoning,
+        )
+
+    # ── execute & log ────────────────────────────────────────────
+
+    async def execute(self, decision: TradeDecision, sig: AISignal, ob: OrderBook):
+        """Simulate fill (swap for real CLOB order in production)."""
+        if decision.direction == "PASS":
+            log.info("  PASS  %-60s  edge=%+.3f", decision.question[:60], decision.edge)
+            return
+
+        log.info(
+            "  %-4s  %-55s  edge=%+.3f  size=$%.2f  @%.3f",
+            decision.direction,
+            decision.question[:55],
+            decision.edge,
+            decision.size_usdc,
+            decision.entry_price,
+        )
+
+        record = TradeRecord(
+            ts          = datetime.now(timezone.utc).isoformat(),
+            market_id   = decision.market_id,
+            question    = decision.question,
+            direction   = decision.direction,
+            entry_price = decision.entry_price,
+            size_usdc   = decision.size_usdc,
+            edge        = decision.edge,
+            ai_prob     = sig.true_prob_estimate,
+            market_prob = ob.implied_yes_prob,
+        )
+        self._records.append(record)
+        self._write(record)
+
+    def _write(self, record: TradeRecord):
+        with open(self._log_path, "a") as fh:
+            fh.write(json.dumps(record.__dict__) + "\n")
+
+    # ── performance report ───────────────────────────────────────
+
+    def report(self) -> dict:
+        closed = [r for r in self._records if r.pnl_usdc is not None]
+        wins   = [r for r in closed if (r.pnl_usdc or 0) > 0]
+        return {
+            "total_decisions":  len(self._records),
+            "closed_positions": len(closed),
+            "win_rate":         len(wins) / len(closed) if closed else None,
+            "total_pnl":        sum(r.pnl_usdc or 0 for r in closed),
+            "avg_edge":         sum(r.edge for r in self._records) / len(self._records)
+                                if self._records else None,
+        }
+
+
+# ─── MAIN LOOP ───────────────────────────────────────────────────
+
+async def run(api_key: str, cycles: int = 0):
+    """
+    Main event loop.
+
+    Each cycle:
+      1. Fetch active markets from Polymarket
+      2. Snapshot order books (async, concurrent)
+      3. Run AI analysis on every snapshot (async, concurrent)
+      4. Feed each (order book, signal) pair into the execution engine
+      5. Sleep until next cycle
+
+    Set cycles=0 for infinite operation.
+    """
+    engine = ExecutionEngine()
+
+    async with aiohttp.ClientSession() as session:
+        poly    = PolymarketClient(session)
+        analyst = AIAnalyst(session, api_key)
+
+        iteration = 0
+        while cycles == 0 or iteration < cycles:
+            iteration += 1
+            log.info("── cycle %d ─────────────────────────", iteration)
+
+            markets = await poly.active_markets(limit=20)
+            log.info("fetched %d markets", len(markets))
+
+            # concurrent snapshots
+            snapshots = await asyncio.gather(
+                *[poly.snapshot(m) for m in markets], return_exceptions=True
+            )
+            valid = [s for s in snapshots if isinstance(s, OrderBook)]
+            log.info("%d valid order books", len(valid))
+
+            # concurrent AI analysis
+            signals = await asyncio.gather(
+                *[analyst.analyse(ob) for ob in valid], return_exceptions=True
+            )
+
+            for ob, sig in zip(valid, signals):
+                if isinstance(sig, Exception):
+                    log.warning("AI analysis failed: %s", sig)
+                    continue
+                decision = engine.decide(ob, sig)
+                await engine.execute(decision, sig, ob)
+
+            report = engine.report()
+            log.info(
+                "performance → decisions=%d  win_rate=%s  pnl=$%.2f  avg_edge=%s",
+                report["total_decisions"],
+                f"{report['win_rate']:.1%}" if report["win_rate"] is not None else "n/a",
+                report["total_pnl"],
+                f"{report['avg_edge']:+.4f}" if report["avg_edge"] is not None else "n/a",
+            )
+
+            if cycles == 0 or iteration < cycles:
+                log.info("sleeping %ds …", LOOP_INTERVAL_SEC)
+                await asyncio.sleep(LOOP_INTERVAL_SEC)
+
+    log.info("loop complete — final report: %s", engine.report())
+
+
+# ─── ENTRY POINT ─────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import os, sys
+
+    key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not key:
+        sys.exit("Set ANTHROPIC_API_KEY env var before running.")
+
+    asyncio.run(run(api_key=key, cycles=3))   # set cycles=0 for 24/7 operation
